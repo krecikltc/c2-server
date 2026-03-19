@@ -59,7 +59,7 @@ init_db()
 
 @app.route('/')
 def index():
-    """Panel webowy - PEŁNA WERSJA z agentami i historią"""
+    """Panel webowy"""
     return '''
     <!DOCTYPE html>
     <html>
@@ -239,7 +239,6 @@ def index():
                 fetch('/api/stats')
                     .then(r => r.json())
                     .then(data => {
-                        // Update stat cards
                         document.getElementById('statTotal').textContent = data.total_bots;
                         document.getElementById('statOnline').textContent = data.online_bots;
                         document.getElementById('statAttacking').textContent = data.attacking_bots;
@@ -322,14 +321,12 @@ def index():
                 });
             }
             
-            // Update co 2 sekundy
             setInterval(() => {
                 loadStats();
                 loadAgents();
                 loadHistory();
             }, 2000);
             
-            // Pierwsze załadowanie
             loadStats();
             loadAgents();
             loadHistory();
